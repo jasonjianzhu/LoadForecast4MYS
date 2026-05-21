@@ -1,0 +1,57 @@
+{
+  "data": {
+    "data_dir": "data",
+    "time_column": "Time",
+    "target_column": "load(kW)",
+    "freq": "5min",
+    "seq_len": 2016,
+    "pred_len": 288,
+    "train_stride": 6,
+    "val_days": 5,
+    "test_days": 7,
+    "holiday_country": "MY",
+    "default_holiday_subdiv": "SGR",
+    "station_holiday_subdiv_map": {
+      "Simpli-Quality-Coils_20260206_20260512_load": "PRK"
+    },
+    "holiday_strict": true,
+    "pre_holiday_days": 1,
+    "post_holiday_days": 1
+  },
+  "model": {
+    "d_model": 128,
+    "d_ff": 256,
+    "e_layers": 3,
+    "n_heads": 4,
+    "dropout": 0.1,
+    "patch_len": 24,
+    "factor": 5,
+    "activation": "gelu",
+    "series_id_embedding_dim": 2,
+    "revin_affine": false,
+    "revin_eps": 1e-5,
+    "huber_delta": 1.0
+  },
+  "train": {
+    "seed": 42,
+    "batch_size": 16,
+    "eval_batch_size": 32,
+    "max_epochs": 60,
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001,
+    "grad_clip_norm": 1.0,
+    "early_stopping_patience": 8,
+    "early_stopping_metric": "nrmse",
+    "scheduler": "plateau",
+    "scheduler_factor": 0.5,
+    "scheduler_patience": 3,
+    "min_learning_rate": 1e-5,
+    "num_workers": 0,
+    "device": "auto"
+  },
+  "output": {
+    "root_dir": "outputs/timexer_final_affine_off",
+    "save_predictions": true,
+    "save_checkpoint_name": "timexer_revin_affine_off_best.pt"
+  }
+}
