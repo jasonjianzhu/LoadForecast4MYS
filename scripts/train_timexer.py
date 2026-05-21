@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 from pathlib import Path
 import sys
 
@@ -13,6 +14,8 @@ if str(SRC_ROOT) not in sys.path:
 from loadforecast.config import ExperimentConfig
 from loadforecast.data import build_datasets
 from loadforecast.trainer import train_and_evaluate
+
+LOGGER = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,13 +30,19 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        stream=sys.stdout,
+        force=True,
+    )
     args = parse_args()
     config = ExperimentConfig.from_json(args.config)
     datasets = build_datasets(config.data)
     output_dir = train_and_evaluate(datasets, config)
-    print(output_dir.resolve())
+    LOGGER.info("training_complete output_dir=%s", output_dir.resolve())
 
 
 if __name__ == "__main__":
     main()
-

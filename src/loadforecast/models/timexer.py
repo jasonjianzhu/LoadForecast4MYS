@@ -103,16 +103,24 @@ class EndogenousEmbedding(nn.Module):
         return self.dropout(x), n_vars
 
 
-class ExogenousEmbedding(nn.Module):
-    def __init__(self, total_len: int, d_model: int, dropout: float):
+class ExogenousPatchEmbedding(nn.Module):
+    def __init__(self, total_len: int, exog_dim: int, d_model: int, patch_len: int, dropout: float):
         super().__init__()
-        self.value_embedding = nn.Linear(total_len, d_model)
+        if total_len % patch_len != 0:
+            raise ValueError("total exogenous length must be divisible by patch_len")
+        self.patch_len = patch_len
+        self.exog_dim = exog_dim
+        self.patch_num = total_len // patch_len
+        self.value_embedding = nn.Linear(patch_len * exog_dim, d_model, bias=False)
+        self.position_embedding = PositionalEmbedding(d_model)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, history_exog: torch.Tensor, future_exog: torch.Tensor) -> torch.Tensor:
         x = torch.cat([history_exog, future_exog], dim=1)
-        x = x.permute(0, 2, 1)
-        return self.dropout(self.value_embedding(x))
+        batch_size = x.shape[0]
+        x = x.reshape(batch_size, self.patch_num, self.patch_len * self.exog_dim)
+        x = self.value_embedding(x) + self.position_embedding(x)
+        return self.dropout(x)
 
 
 class EncoderLayer(nn.Module):
@@ -170,6 +178,8 @@ class TimeXerBackbone(nn.Module):
         super().__init__()
         if seq_len % config.patch_len != 0:
             raise ValueError("seq_len must be divisible by patch_len")
+        if (seq_len + pred_len) % config.patch_len != 0:
+            raise ValueError("seq_len + pred_len must be divisible by patch_len")
 
         self.seq_len = seq_len
         self.pred_len = pred_len
@@ -177,7 +187,13 @@ class TimeXerBackbone(nn.Module):
         self.patch_len = config.patch_len
         self.patch_num = seq_len // config.patch_len
         self.endogenous_embedding = EndogenousEmbedding(n_vars=1, d_model=config.d_model, patch_len=config.patch_len, dropout=config.dropout)
-        self.exogenous_embedding = ExogenousEmbedding(total_len=seq_len + pred_len, d_model=config.d_model, dropout=config.dropout)
+        self.exogenous_embedding = ExogenousPatchEmbedding(
+            total_len=seq_len + pred_len,
+            exog_dim=exog_dim,
+            d_model=config.d_model,
+            patch_len=config.patch_len,
+            dropout=config.dropout,
+        )
         self.encoder = Encoder(
             layers=[
                 EncoderLayer(
@@ -285,4 +301,3 @@ class LoadForecastModel(nn.Module):
         future_target = future_target.unsqueeze(-1)
         normalized = self.revin.normalize_with_stats(future_target, stats)
         return normalized.squeeze(-1)
-

@@ -19,18 +19,23 @@
     "post_holiday_days": 1
   },
   "model": {
-    "d_model": 128,
-    "d_ff": 256,
-    "e_layers": 3,
+    "d_model": 192,
+    "d_ff": 384,
+    "e_layers": 4,
     "n_heads": 4,
     "dropout": 0.1,
-    "patch_len": 24,
+    "patch_len": 12,
     "factor": 5,
     "activation": "gelu",
     "series_id_embedding_dim": 2,
     "revin_affine": false,
     "revin_eps": 1e-5,
-    "huber_delta": 1.0
+    "huber_delta": 1.0,
+    "loss_huber_weight": 0.5,
+    "loss_mse_weight": 0.5,
+    "peak_focus_quantile": 0.9,
+    "peak_focus_weight": 1.0,
+    "underprediction_weight": 0.25
   },
   "train": {
     "seed": 42,

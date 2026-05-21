@@ -27,18 +27,23 @@ class DataConfig:
 
 @dataclass
 class ModelConfig:
-    d_model: int = 128
-    d_ff: int = 256
-    e_layers: int = 3
+    d_model: int = 192
+    d_ff: int = 384
+    e_layers: int = 4
     n_heads: int = 4
     dropout: float = 0.1
-    patch_len: int = 24
+    patch_len: int = 12
     factor: int = 5
     activation: str = "gelu"
     series_id_embedding_dim: int = 2
     revin_affine: bool = False
     revin_eps: float = 1e-5
     huber_delta: float = 1.0
+    loss_huber_weight: float = 0.5
+    loss_mse_weight: float = 0.5
+    peak_focus_quantile: float = 0.9
+    peak_focus_weight: float = 1.0
+    underprediction_weight: float = 0.25
 
 
 @dataclass

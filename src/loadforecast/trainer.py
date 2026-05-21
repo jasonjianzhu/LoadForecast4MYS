@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import asdict
 import json
+import logging
 from pathlib import Path
 import random
 import re
@@ -19,6 +20,8 @@ from loadforecast.data import ForecastWindowDataset
 from loadforecast.metrics import compute_all_metrics
 from loadforecast.models.timexer import ForwardOutput, LoadForecastModel
 from loadforecast.plotting import generate_test_prediction_plots
+
+LOGGER = logging.getLogger(__name__)
 
 
 def set_seed(seed: int) -> None:
@@ -121,18 +124,57 @@ def create_optimizer_and_scheduler(model: nn.Module, cfg: ExperimentConfig):
     return optimizer, scheduler
 
 
+def build_peak_focus_weights(target: torch.Tensor, quantile: float, extra_weight: float) -> torch.Tensor:
+    if extra_weight <= 0:
+        return torch.ones_like(target)
+
+    quantile = float(np.clip(quantile, 0.0, 1.0))
+    num_steps = target.shape[1]
+    kth_index = min(max(int(np.ceil(quantile * num_steps)), 1), num_steps)
+    threshold = target.kthvalue(kth_index, dim=1, keepdim=True).values
+    peak_mask = target >= threshold
+    return 1.0 + extra_weight * peak_mask.float()
+
+
+def compute_training_objective(
+    model: LoadForecastModel,
+    output: ForwardOutput,
+    future_target: torch.Tensor,
+    cfg: ExperimentConfig,
+) -> torch.Tensor:
+    target_norm = model.normalize_future_target(future_target, output.revin_stats)
+    point_weights = build_peak_focus_weights(
+        target=future_target,
+        quantile=cfg.model.peak_focus_quantile,
+        extra_weight=cfg.model.peak_focus_weight,
+    )
+    huber = nn.functional.huber_loss(
+        output.prediction_norm,
+        target_norm,
+        delta=cfg.model.huber_delta,
+        reduction="none",
+    )
+    mse = (output.prediction_norm - target_norm).pow(2)
+    underprediction = torch.relu(target_norm - output.prediction_norm)
+    pointwise_loss = (
+        cfg.model.loss_huber_weight * huber
+        + cfg.model.loss_mse_weight * mse
+        + cfg.model.underprediction_weight * underprediction
+    )
+    return (pointwise_loss * point_weights).sum() / point_weights.sum().clamp_min(1.0)
+
+
 def train_one_epoch(
     model: LoadForecastModel,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    delta: float,
+    cfg: ExperimentConfig,
     grad_clip_norm: float,
 ) -> float:
     model.train()
     total_loss = 0.0
     total_count = 0
-    criterion = nn.HuberLoss(delta=delta)
 
     for batch in loader:
         optimizer.zero_grad(set_to_none=True)
@@ -151,8 +193,7 @@ def train_one_epoch(
             return_aux=True,
         )
         assert isinstance(output, ForwardOutput)
-        target_norm = model.normalize_future_target(future_target, output.revin_stats)
-        loss = criterion(output.prediction_norm, target_norm)
+        loss = compute_training_objective(model=model, output=output, future_target=future_target, cfg=cfg)
         loss.backward()
         if grad_clip_norm > 0:
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
@@ -169,10 +210,9 @@ def evaluate(
     model: LoadForecastModel,
     loader: DataLoader,
     device: torch.device,
-    delta: float,
+    cfg: ExperimentConfig,
 ) -> tuple[dict[str, float], pd.DataFrame]:
     model.eval()
-    criterion = nn.HuberLoss(delta=delta)
     total_loss = 0.0
     total_count = 0
     prediction_rows: list[dict[str, Any]] = []
@@ -193,8 +233,7 @@ def evaluate(
                 return_aux=True,
             )
             assert isinstance(output, ForwardOutput)
-            target_norm = model.normalize_future_target(future_target, output.revin_stats)
-            loss = criterion(output.prediction_norm, target_norm)
+            loss = compute_training_objective(model=model, output=output, future_target=future_target, cfg=cfg)
             batch_size = history_target.shape[0]
             total_loss += float(loss.item()) * batch_size
             total_count += batch_size
@@ -303,10 +342,10 @@ def train_and_evaluate(dataset_map: dict[str, ForecastWindowDataset], cfg: Exper
             loader=dataloaders["train"],
             optimizer=optimizer,
             device=device,
-            delta=cfg.model.huber_delta,
+            cfg=cfg,
             grad_clip_norm=cfg.train.grad_clip_norm,
         )
-        val_metrics, _ = evaluate(model=model, loader=dataloaders["val"], device=device, delta=cfg.model.huber_delta)
+        val_metrics, _ = evaluate(model=model, loader=dataloaders["val"], device=device, cfg=cfg)
         score = float(val_metrics[cfg.train.early_stopping_metric])
 
         history_rows.append(
@@ -317,20 +356,20 @@ def train_and_evaluate(dataset_map: dict[str, ForecastWindowDataset], cfg: Exper
                 "learning_rate": optimizer.param_groups[0]["lr"],
             }
         )
-        print(
-            f"epoch={epoch} "
-            f"train_loss={train_loss:.6f} "
-            f"val_loss={val_metrics['loss']:.6f} "
-            f"val_mae={val_metrics['mae']:.6f} "
-            f"val_nrmse={val_metrics['nrmse']:.6f} "
-            f"lr={optimizer.param_groups[0]['lr']:.6g}",
-            flush=True,
+        LOGGER.info(
+            "epoch=%s train_loss=%.6f val_loss=%.6f val_mae=%.6f val_nrmse=%.6f lr=%.6g",
+            epoch,
+            train_loss,
+            val_metrics["loss"],
+            val_metrics["mae"],
+            val_metrics["nrmse"],
+            optimizer.param_groups[0]["lr"],
         )
 
         improved = early_stopper.step(epoch, score)
         if improved:
             torch.save({"model_state_dict": model.state_dict(), "epoch": epoch}, checkpoint_path)
-            print(f"checkpoint_saved epoch={epoch}", flush=True)
+            LOGGER.info("checkpoint_saved epoch=%s", epoch)
 
         if scheduler is not None:
             if cfg.train.scheduler == "plateau":
@@ -339,11 +378,12 @@ def train_and_evaluate(dataset_map: dict[str, ForecastWindowDataset], cfg: Exper
                 scheduler.step()
 
         if early_stopper.should_stop:
-            print(
-                f"early_stopping epoch={epoch} "
-                f"best_epoch={early_stopper.best_epoch} "
-                f"best_{cfg.train.early_stopping_metric}={early_stopper.best_score:.6f}",
-                flush=True,
+            LOGGER.info(
+                "early_stopping epoch=%s best_epoch=%s best_%s=%.6f",
+                epoch,
+                early_stopper.best_epoch,
+                cfg.train.early_stopping_metric,
+                early_stopper.best_score,
             )
             break
 
@@ -354,7 +394,7 @@ def train_and_evaluate(dataset_map: dict[str, ForecastWindowDataset], cfg: Exper
 
     summary: dict[str, Any] = {"best_epoch": int(checkpoint["epoch"])}
     for split in ("val", "test"):
-        metrics, frame = evaluate(model=model, loader=dataloaders[split], device=device, delta=cfg.model.huber_delta)
+        metrics, frame = evaluate(model=model, loader=dataloaders[split], device=device, cfg=cfg)
         summary[split] = metrics
         summary[f"{split}_by_scenario"] = summarize_by_group(frame, "scenario").to_dict(orient="records")
         summary[f"{split}_by_series"] = summarize_by_group(frame, "series_name").to_dict(orient="records")
