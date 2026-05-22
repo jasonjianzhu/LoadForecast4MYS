@@ -20,7 +20,7 @@
     "post_holiday_days": 1
   },
   "model": {
-    "backbone": "timexer",
+    "backbone": "patchtst",
     "d_model": 192,
     "d_ff": 384,
     "e_layers": 4,
@@ -47,9 +47,9 @@
     "underprediction_weight": 0.0,
     "pinball_tau": 0.65,
     "peak_top_k": 24,
-    "peak_loss_weight": 0.2,
-    "underprediction_topk_weight": 0.08,
-    "daily_max_loss_weight": 0.0,
+    "peak_loss_weight": 0.3,
+    "underprediction_topk_weight": 0.15,
+    "daily_max_loss_weight": 0.1,
     "holiday_loss_weight": 1.0,
     "scenario_loss_weights": {},
     "station_weight_clip_min": 1.0,
@@ -72,11 +72,12 @@
     "num_workers": 0,
     "train_sampler": "station_balanced",
     "station_balance_power": 0.5,
+    "log_interval_steps": 50,
     "device": "auto"
   },
   "output": {
-    "root_dir": "outputs/experiments/timexer_e04_balanced_sampler",
+    "root_dir": "outputs/experiments/patchtst_e04_e02_peak_loss",
     "save_predictions": true,
-    "save_checkpoint_name": "timexer_e04_best.pt"
+    "save_checkpoint_name": "patchtst_e04_e02_best.pt"
   }
 }

@@ -19,7 +19,9 @@ LOGGER = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train the TimeXer-based load forecasting model.")
+    parser = argparse.ArgumentParser(
+        description="Train load forecasting models (TimeXer, PatchTST, ModernTCN)."
+    )
     parser.add_argument(
         "--config",
         type=str,

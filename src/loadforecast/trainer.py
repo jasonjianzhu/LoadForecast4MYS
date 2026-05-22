@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from loadforecast.config import ExperimentConfig
 from loadforecast.data import ForecastWindowDataset
-from loadforecast.metrics import compute_all_metrics
+from loadforecast.metrics import compute_all_metrics, compute_peak_metrics
 from loadforecast.models.common import ForwardOutput
 from loadforecast.models.moderntcn import ModernTCNForecastModel
 from loadforecast.models.patchtst import PatchTSTForecastModel
@@ -456,6 +456,32 @@ def summarize_by_group(prediction_frame: pd.DataFrame, group_column: str) -> pd.
     return pd.DataFrame(rows)
 
 
+def summarize_peak_by_series(prediction_frame: pd.DataFrame) -> list[dict[str, Any]]:
+    """Per-series peak diagnostics averaged over forecast days."""
+    rows: list[dict[str, Any]] = []
+    for series_name, group in prediction_frame.groupby("series_name"):
+        peak_ratios: list[float] = []
+        peak_errs: list[float] = []
+        nonpeak_biases: list[float] = []
+        for _, row in group.iterrows():
+            y_true = np.asarray(row["y_true"], dtype=np.float64)
+            y_pred = np.asarray(row["y_pred"], dtype=np.float64)
+            peak = compute_peak_metrics(y_true, y_pred)
+            peak_ratios.append(peak["peak_ratio"])
+            peak_errs.append(peak["peak_err"])
+            if not np.isnan(peak["nonpeak_bias"]):
+                nonpeak_biases.append(peak["nonpeak_bias"])
+        rows.append(
+            {
+                "series_name": series_name,
+                "peak_ratio_mean": float(np.mean(peak_ratios)),
+                "peak_err_mean": float(np.mean(peak_errs)),
+                "nonpeak_bias_mean": float(np.mean(nonpeak_biases)) if nonpeak_biases else float("nan"),
+            }
+        )
+    return rows
+
+
 def save_prediction_frame(prediction_frame: pd.DataFrame, output_path: Path) -> None:
     exploded_rows: list[dict[str, Any]] = []
     for _, row in prediction_frame.iterrows():
@@ -587,6 +613,7 @@ def train_and_evaluate(dataset_map: dict[str, ForecastWindowDataset], cfg: Exper
         summary[split] = metrics
         summary[f"{split}_by_scenario"] = summarize_by_group(frame, "scenario").to_dict(orient="records")
         summary[f"{split}_by_series"] = summarize_by_group(frame, "series_name").to_dict(orient="records")
+        summary[f"{split}_peak_by_series"] = summarize_peak_by_series(frame)
         if cfg.output.save_predictions:
             filename = "validation_predictions.csv" if split == "val" else f"{split}_predictions.csv"
             save_prediction_frame(frame, output_dir / filename)

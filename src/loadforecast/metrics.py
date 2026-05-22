@@ -45,3 +45,29 @@ def compute_all_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Mapping[str, 
         "mape": mape_clipped(y_true, y_pred),
     }
 
+
+def peak_ratio_at_true_peak(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    peak_idx = int(np.argmax(y_true))
+    return float(y_pred[peak_idx] / max(y_true[peak_idx], 1.0))
+
+
+def peak_error_at_true_peak(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    peak_idx = int(np.argmax(y_true))
+    return float(y_pred[peak_idx] - y_true[peak_idx])
+
+
+def nonpeak_bias(y_true: np.ndarray, y_pred: np.ndarray, quantile: float = 0.8) -> float:
+    threshold = float(np.quantile(y_true, quantile))
+    mask = y_true < threshold
+    if not mask.any():
+        return float("nan")
+    return float(np.mean(y_pred[mask] - y_true[mask]))
+
+
+def compute_peak_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Mapping[str, float]:
+    return {
+        "peak_ratio": peak_ratio_at_true_peak(y_true, y_pred),
+        "peak_err": peak_error_at_true_peak(y_true, y_pred),
+        "nonpeak_bias": nonpeak_bias(y_true, y_pred),
+    }
+
