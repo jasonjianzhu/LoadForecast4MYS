@@ -11,6 +11,7 @@ class DataConfig:
     data_dir: str = "data"
     time_column: str = "Time"
     target_column: str = "load(kW)"
+    target_clip_min: float | None = None
     freq: str = "5min"
     seq_len: int = 2016
     pred_len: int = 288
@@ -27,23 +28,40 @@ class DataConfig:
 
 @dataclass
 class ModelConfig:
+    backbone: str = "timexer"
     d_model: int = 192
     d_ff: int = 384
     e_layers: int = 4
     n_heads: int = 4
     dropout: float = 0.1
     patch_len: int = 12
+    patch_stride: int = 6
+    tcn_num_blocks: int = 6
+    tcn_large_kernel_size: int = 25
+    tcn_small_kernel_size: int = 5
     factor: int = 5
     activation: str = "gelu"
-    series_id_embedding_dim: int = 2
+    series_id_embedding_dim: int = 4
+    series_id_mode: str = "repeat"
     revin_affine: bool = False
+    revin_per_station_affine: bool = False
     revin_eps: float = 1e-5
+    base_loss: str = "pinball"
     huber_delta: float = 1.0
-    loss_huber_weight: float = 0.5
-    loss_mse_weight: float = 0.5
-    peak_focus_quantile: float = 0.9
-    peak_focus_weight: float = 1.0
-    underprediction_weight: float = 0.25
+    loss_huber_weight: float = 0.0
+    loss_mse_weight: float = 0.0
+    pointwise_peak_focus_quantile: float | None = None
+    pointwise_peak_focus_weight: float = 0.0
+    underprediction_weight: float = 0.0
+    pinball_tau: float = 0.65
+    peak_top_k: int = 24
+    peak_loss_weight: float = 0.3
+    underprediction_topk_weight: float = 0.0
+    daily_max_loss_weight: float = 0.1
+    holiday_loss_weight: float = 1.0
+    scenario_loss_weights: dict[str, float] = field(default_factory=dict)
+    station_weight_clip_min: float = 0.9
+    station_weight_clip_max: float = 1.15
 
 
 @dataclass
@@ -62,6 +80,9 @@ class TrainConfig:
     scheduler_patience: int = 3
     min_learning_rate: float = 1e-5
     num_workers: int = 0
+    train_sampler: str = "shuffle"
+    station_balance_power: float = 0.5
+    log_interval_steps: int = 0
     device: str = "auto"
 
 

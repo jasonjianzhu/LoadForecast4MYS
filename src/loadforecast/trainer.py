@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import asdict
 import json
 import logging
 from pathlib import Path
@@ -13,12 +12,15 @@ import numpy as np
 import pandas as pd
 import torch
 from torch import nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from loadforecast.config import ExperimentConfig
 from loadforecast.data import ForecastWindowDataset
 from loadforecast.metrics import compute_all_metrics
-from loadforecast.models.timexer import ForwardOutput, LoadForecastModel
+from loadforecast.models.common import ForwardOutput
+from loadforecast.models.moderntcn import ModernTCNForecastModel
+from loadforecast.models.patchtst import PatchTSTForecastModel
+from loadforecast.models.timexer import LoadForecastModel
 from loadforecast.plotting import generate_test_prediction_plots
 
 LOGGER = logging.getLogger(__name__)
@@ -64,11 +66,34 @@ class EarlyStopper:
 
 def make_dataloaders(dataset_map: dict[str, ForecastWindowDataset], cfg: ExperimentConfig) -> dict[str, DataLoader]:
     train_cfg = cfg.train
+    train_dataset = dataset_map["train"]
+    train_sampler = None
+    shuffle = True
+    if train_cfg.train_sampler == "station_balanced":
+        station_counts: dict[int, int] = defaultdict(int)
+        for spec in train_dataset.specs:
+            station_counts[spec.station_id] += 1
+        if station_counts:
+            power = train_cfg.station_balance_power
+            weights = [
+                1.0 / float(station_counts[spec.station_id] ** power)
+                for spec in train_dataset.specs
+            ]
+            train_sampler = WeightedRandomSampler(
+                weights=weights,
+                num_samples=len(weights),
+                replacement=True,
+            )
+            shuffle = False
+    elif train_cfg.train_sampler != "shuffle":
+        raise ValueError(f"Unsupported train_sampler: {train_cfg.train_sampler}")
+
     return {
         "train": DataLoader(
-            dataset_map["train"],
+            train_dataset,
             batch_size=train_cfg.batch_size,
-            shuffle=True,
+            shuffle=shuffle,
+            sampler=train_sampler,
             num_workers=train_cfg.num_workers,
         ),
         "val": DataLoader(
@@ -86,18 +111,25 @@ def make_dataloaders(dataset_map: dict[str, ForecastWindowDataset], cfg: Experim
     }
 
 
-def build_model(dataset_map: dict[str, ForecastWindowDataset], cfg: ExperimentConfig) -> LoadForecastModel:
+def build_model(dataset_map: dict[str, ForecastWindowDataset], cfg: ExperimentConfig) -> nn.Module:
     train_dataset = dataset_map["train"]
     if len(train_dataset.stores) == 0:
         raise ValueError("No stations were loaded.")
     exog_dim = train_dataset.stores[0].exog.shape[1]
-    return LoadForecastModel(
-        seq_len=cfg.data.seq_len,
-        pred_len=cfg.data.pred_len,
-        exog_dim=exog_dim,
-        num_series=len(train_dataset.stores),
-        config=cfg.model,
-    )
+    common_kwargs = {
+        "seq_len": cfg.data.seq_len,
+        "pred_len": cfg.data.pred_len,
+        "exog_dim": exog_dim,
+        "num_series": len(train_dataset.stores),
+        "config": cfg.model,
+    }
+    if cfg.model.backbone == "timexer":
+        return LoadForecastModel(**common_kwargs)
+    if cfg.model.backbone == "moderntcn":
+        return ModernTCNForecastModel(**common_kwargs)
+    if cfg.model.backbone == "patchtst":
+        return PatchTSTForecastModel(**common_kwargs)
+    raise ValueError(f"Unsupported backbone: {cfg.model.backbone}")
 
 
 def create_optimizer_and_scheduler(model: nn.Module, cfg: ExperimentConfig):
@@ -124,8 +156,27 @@ def create_optimizer_and_scheduler(model: nn.Module, cfg: ExperimentConfig):
     return optimizer, scheduler
 
 
-def build_peak_focus_weights(target: torch.Tensor, quantile: float, extra_weight: float) -> torch.Tensor:
-    if extra_weight <= 0:
+def build_station_sample_weights(train_dataset: ForecastWindowDataset) -> torch.Tensor:
+    """Return per-station weight vector so that stations with fewer training samples
+    are not dominated by data-rich stations during gradient updates."""
+    station_counts: dict[int, int] = defaultdict(int)
+    for spec in train_dataset.specs:
+        station_counts[spec.station_id] += 1
+    if not station_counts:
+        return torch.ones(len(train_dataset.stores))
+    weights = torch.ones(len(train_dataset.stores), dtype=torch.float32)
+    for station_id, count in station_counts.items():
+        weights[station_id] = 1.0 / float(np.log1p(count))
+    weights = weights / weights.mean().clamp_min(1e-6)
+    return weights
+
+
+def build_peak_focus_weights(
+    target: torch.Tensor,
+    quantile: float | None,
+    extra_weight: float,
+) -> torch.Tensor:
+    if quantile is None or extra_weight <= 0:
         return torch.ones_like(target)
 
     quantile = float(np.clip(quantile, 0.0, 1.0))
@@ -136,32 +187,143 @@ def build_peak_focus_weights(target: torch.Tensor, quantile: float, extra_weight
     return 1.0 + extra_weight * peak_mask.float()
 
 
+def huber_loss_pointwise(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    delta: float,
+) -> torch.Tensor:
+    diff = prediction - target
+    abs_diff = diff.abs()
+    quadratic = torch.minimum(abs_diff, torch.full_like(abs_diff, delta))
+    linear = abs_diff - quadratic
+    return 0.5 * quadratic.pow(2) + delta * linear
+
+
+def compute_pointwise_loss(
+    model: LoadForecastModel,
+    output: ForwardOutput,
+    future_target: torch.Tensor,
+    series_id: torch.Tensor,
+    cfg: ExperimentConfig,
+) -> torch.Tensor:
+    target_norm = model.normalize_future_target(future_target, output.revin_stats, series_id=series_id)
+    point_weights = build_peak_focus_weights(
+        target=future_target,
+        quantile=cfg.model.pointwise_peak_focus_quantile,
+        extra_weight=cfg.model.pointwise_peak_focus_weight,
+    )
+    if cfg.model.base_loss == "pinball":
+        diff = target_norm - output.prediction_norm
+        tau = cfg.model.pinball_tau
+        pointwise = torch.max(tau * diff, (tau - 1.0) * diff)
+        return pointwise * point_weights
+    if cfg.model.base_loss == "hybrid":
+        huber = huber_loss_pointwise(
+            prediction=output.prediction_norm,
+            target=target_norm,
+            delta=cfg.model.huber_delta,
+        )
+        mse = (output.prediction_norm - target_norm).pow(2)
+        underprediction = torch.relu(target_norm - output.prediction_norm)
+        pointwise = (
+            cfg.model.loss_huber_weight * huber
+            + cfg.model.loss_mse_weight * mse
+            + cfg.model.underprediction_weight * underprediction
+        )
+        return pointwise * point_weights
+    raise ValueError(f"Unsupported base_loss: {cfg.model.base_loss}")
+
+
+def compute_peak_losses(
+    model: LoadForecastModel,
+    output: ForwardOutput,
+    future_target: torch.Tensor,
+    series_id: torch.Tensor,
+    cfg: ExperimentConfig,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    target_norm = model.normalize_future_target(future_target, output.revin_stats, series_id=series_id)
+    top_k = max(1, min(cfg.model.peak_top_k, future_target.shape[1]))
+    peak_indices = future_target.topk(top_k, dim=1).indices
+
+    pred_topk = output.prediction_norm.gather(dim=1, index=peak_indices)
+    true_topk = target_norm.gather(dim=1, index=peak_indices)
+    peak_loss = huber_loss_pointwise(
+        prediction=pred_topk,
+        target=true_topk,
+        delta=cfg.model.huber_delta,
+    ).mean(dim=1)
+    underprediction_topk = torch.relu(true_topk - pred_topk).mean(dim=1)
+
+    pred_daily_max = output.prediction_norm.max(dim=1).values
+    true_daily_max = target_norm.max(dim=1).values
+    daily_max_loss = (pred_daily_max - true_daily_max).pow(2)
+    return peak_loss, underprediction_topk, daily_max_loss
+
+
+def compute_scenario_weights(
+    scenario: list[str],
+    device: torch.device,
+    cfg: ExperimentConfig,
+) -> torch.Tensor:
+    if cfg.model.scenario_loss_weights:
+        default_weight = 1.0
+        weights = [
+            float(cfg.model.scenario_loss_weights.get(s, default_weight))
+            for s in scenario
+        ]
+        return torch.tensor(weights, dtype=torch.float32, device=device)
+
+    holiday_mask = torch.tensor(
+        ["holiday" in s for s in scenario],
+        dtype=torch.float32,
+        device=device,
+    )
+    return 1.0 - (1.0 - cfg.model.holiday_loss_weight) * holiday_mask
+
+
 def compute_training_objective(
     model: LoadForecastModel,
     output: ForwardOutput,
     future_target: torch.Tensor,
+    series_id: torch.Tensor,
+    scenario: list[str],
+    station_weights: torch.Tensor,
     cfg: ExperimentConfig,
 ) -> torch.Tensor:
-    target_norm = model.normalize_future_target(future_target, output.revin_stats)
-    point_weights = build_peak_focus_weights(
-        target=future_target,
-        quantile=cfg.model.peak_focus_quantile,
-        extra_weight=cfg.model.peak_focus_weight,
+    pointwise = compute_pointwise_loss(
+        model=model, output=output, future_target=future_target,
+        series_id=series_id, cfg=cfg,
     )
-    huber = nn.functional.huber_loss(
-        output.prediction_norm,
-        target_norm,
-        delta=cfg.model.huber_delta,
-        reduction="none",
+    peak_loss, underprediction_topk, daily_max_loss = compute_peak_losses(
+        model=model,
+        output=output,
+        future_target=future_target,
+        series_id=series_id,
+        cfg=cfg,
     )
-    mse = (output.prediction_norm - target_norm).pow(2)
-    underprediction = torch.relu(target_norm - output.prediction_norm)
-    pointwise_loss = (
-        cfg.model.loss_huber_weight * huber
-        + cfg.model.loss_mse_weight * mse
-        + cfg.model.underprediction_weight * underprediction
+    sample_loss = pointwise.mean(dim=1)
+    sample_loss = (
+        sample_loss
+        + cfg.model.peak_loss_weight * peak_loss
+        + cfg.model.underprediction_topk_weight * underprediction_topk
+        + cfg.model.daily_max_loss_weight * daily_max_loss
     )
-    return (pointwise_loss * point_weights).sum() / point_weights.sum().clamp_min(1.0)
+
+    station_weight = station_weights.to(series_id.device)[series_id]
+    station_weight = station_weight.clamp(
+        min=cfg.model.station_weight_clip_min,
+        max=cfg.model.station_weight_clip_max,
+    )
+    sample_loss = sample_loss * station_weight
+
+    scenario_weight = compute_scenario_weights(
+        scenario=scenario,
+        device=sample_loss.device,
+        cfg=cfg,
+    )
+    sample_loss = sample_loss * scenario_weight
+
+    return sample_loss.sum() / sample_loss.numel()
 
 
 def train_one_epoch(
@@ -170,13 +332,14 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     cfg: ExperimentConfig,
+    station_weights: torch.Tensor,
     grad_clip_norm: float,
 ) -> float:
     model.train()
     total_loss = 0.0
     total_count = 0
 
-    for batch in loader:
+    for step_idx, batch in enumerate(loader, start=1):
         optimizer.zero_grad(set_to_none=True)
 
         history_target = batch["history_target"].to(device)
@@ -193,7 +356,11 @@ def train_one_epoch(
             return_aux=True,
         )
         assert isinstance(output, ForwardOutput)
-        loss = compute_training_objective(model=model, output=output, future_target=future_target, cfg=cfg)
+        loss = compute_training_objective(
+            model=model, output=output, future_target=future_target,
+            series_id=series_id, scenario=batch["scenario"],
+            station_weights=station_weights, cfg=cfg,
+        )
         loss.backward()
         if grad_clip_norm > 0:
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
@@ -203,6 +370,15 @@ def train_one_epoch(
         total_loss += float(loss.item()) * batch_size
         total_count += batch_size
 
+        if cfg.train.log_interval_steps > 0 and step_idx % cfg.train.log_interval_steps == 0:
+            LOGGER.info(
+                "train_step=%s/%s batch_loss=%.6f running_loss=%.6f",
+                step_idx,
+                len(loader),
+                float(loss.item()),
+                total_loss / max(total_count, 1),
+            )
+
     return total_loss / max(total_count, 1)
 
 
@@ -211,6 +387,7 @@ def evaluate(
     loader: DataLoader,
     device: torch.device,
     cfg: ExperimentConfig,
+    station_weights: torch.Tensor,
 ) -> tuple[dict[str, float], pd.DataFrame]:
     model.eval()
     total_loss = 0.0
@@ -233,7 +410,11 @@ def evaluate(
                 return_aux=True,
             )
             assert isinstance(output, ForwardOutput)
-            loss = compute_training_objective(model=model, output=output, future_target=future_target, cfg=cfg)
+            loss = compute_training_objective(
+                model=model, output=output, future_target=future_target,
+                series_id=series_id, scenario=batch["scenario"],
+                station_weights=station_weights, cfg=cfg,
+            )
             batch_size = history_target.shape[0]
             total_loss += float(loss.item()) * batch_size
             total_count += batch_size
@@ -330,6 +511,7 @@ def train_and_evaluate(dataset_map: dict[str, ForecastWindowDataset], cfg: Exper
 
     device = resolve_device(cfg.train.device)
     dataloaders = make_dataloaders(dataset_map, cfg)
+    station_weights = build_station_sample_weights(dataset_map["train"])
     model = build_model(dataset_map, cfg).to(device)
     optimizer, scheduler = create_optimizer_and_scheduler(model, cfg)
     early_stopper = EarlyStopper(patience=cfg.train.early_stopping_patience)
@@ -343,9 +525,13 @@ def train_and_evaluate(dataset_map: dict[str, ForecastWindowDataset], cfg: Exper
             optimizer=optimizer,
             device=device,
             cfg=cfg,
+            station_weights=station_weights,
             grad_clip_norm=cfg.train.grad_clip_norm,
         )
-        val_metrics, _ = evaluate(model=model, loader=dataloaders["val"], device=device, cfg=cfg)
+        val_metrics, _ = evaluate(
+            model=model, loader=dataloaders["val"], device=device,
+            cfg=cfg, station_weights=station_weights,
+        )
         score = float(val_metrics[cfg.train.early_stopping_metric])
 
         history_rows.append(
@@ -394,7 +580,10 @@ def train_and_evaluate(dataset_map: dict[str, ForecastWindowDataset], cfg: Exper
 
     summary: dict[str, Any] = {"best_epoch": int(checkpoint["epoch"])}
     for split in ("val", "test"):
-        metrics, frame = evaluate(model=model, loader=dataloaders[split], device=device, cfg=cfg)
+        metrics, frame = evaluate(
+            model=model, loader=dataloaders[split], device=device,
+            cfg=cfg, station_weights=station_weights,
+        )
         summary[split] = metrics
         summary[f"{split}_by_scenario"] = summarize_by_group(frame, "scenario").to_dict(orient="records")
         summary[f"{split}_by_series"] = summarize_by_group(frame, "series_name").to_dict(orient="records")

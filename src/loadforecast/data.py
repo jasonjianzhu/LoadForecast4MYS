@@ -92,6 +92,12 @@ def resolve_station_holiday_subdiv(station_name: str, cfg: DataConfig) -> str:
     return cfg.station_holiday_subdiv_map.get(station_name, cfg.default_holiday_subdiv)
 
 
+def _clip_target_values(target: np.ndarray, clip_min: float | None) -> np.ndarray:
+    if clip_min is None:
+        return target
+    return np.where(np.isnan(target), target, np.maximum(target, clip_min))
+
+
 def load_station_store(path: Path, station_id: int, cfg: DataConfig) -> StationStore:
     frame = pd.read_csv(path)
     frame.columns = [str(column).strip().replace("\ufeff", "") for column in frame.columns]
@@ -130,6 +136,7 @@ def load_station_store(path: Path, station_id: int, cfg: DataConfig) -> StationS
     )
 
     target = frame[cfg.target_column].to_numpy(dtype=np.float32)
+    target = _clip_target_values(target, cfg.target_clip_min)
     observed = ~np.isnan(target)
     day_counts = pd.Series(observed.astype(np.int16), index=full_index).groupby(full_index.normalize()).sum()
     expected_per_day = int(pd.Timedelta(days=1) / pd.Timedelta(cfg.freq))

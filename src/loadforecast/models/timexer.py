@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
 
 import torch
@@ -8,6 +7,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from loadforecast.config import ModelConfig
+from loadforecast.models.common import ForwardOutput
 from loadforecast.models.revin import RevIN, RevINStats
 
 
@@ -83,9 +83,10 @@ class FlattenHead(nn.Module):
 
 
 class EndogenousEmbedding(nn.Module):
-    def __init__(self, n_vars: int, d_model: int, patch_len: int, dropout: float):
+    def __init__(self, n_vars: int, d_model: int, patch_len: int, patch_stride: int, dropout: float):
         super().__init__()
         self.patch_len = patch_len
+        self.patch_stride = patch_stride
         self.value_embedding = nn.Linear(patch_len, d_model, bias=False)
         self.global_token = nn.Parameter(torch.randn(1, n_vars, 1, d_model))
         self.position_embedding = PositionalEmbedding(d_model)
@@ -93,7 +94,7 @@ class EndogenousEmbedding(nn.Module):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, int]:
         n_vars = x.shape[1]
-        x = x.unfold(dimension=-1, size=self.patch_len, step=self.patch_len)
+        x = x.unfold(dimension=-1, size=self.patch_len, step=self.patch_stride)
         x = x.reshape(x.shape[0] * x.shape[1], x.shape[2], x.shape[3])
         x = self.value_embedding(x) + self.position_embedding(x)
         x = x.reshape(-1, n_vars, x.shape[-2], x.shape[-1])
@@ -104,21 +105,20 @@ class EndogenousEmbedding(nn.Module):
 
 
 class ExogenousPatchEmbedding(nn.Module):
-    def __init__(self, total_len: int, exog_dim: int, d_model: int, patch_len: int, dropout: float):
+    def __init__(self, total_len: int, exog_dim: int, d_model: int, patch_len: int, patch_stride: int, dropout: float):
         super().__init__()
-        if total_len % patch_len != 0:
-            raise ValueError("total exogenous length must be divisible by patch_len")
         self.patch_len = patch_len
+        self.patch_stride = patch_stride
         self.exog_dim = exog_dim
-        self.patch_num = total_len // patch_len
+        self.patch_num = (total_len - patch_len) // patch_stride + 1
         self.value_embedding = nn.Linear(patch_len * exog_dim, d_model, bias=False)
         self.position_embedding = PositionalEmbedding(d_model)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, history_exog: torch.Tensor, future_exog: torch.Tensor) -> torch.Tensor:
         x = torch.cat([history_exog, future_exog], dim=1)
-        batch_size = x.shape[0]
-        x = x.reshape(batch_size, self.patch_num, self.patch_len * self.exog_dim)
+        x = x.transpose(1, 2).unfold(dimension=-1, size=self.patch_len, step=self.patch_stride)
+        x = x.permute(0, 2, 3, 1).reshape(x.shape[0], x.shape[2], self.patch_len * self.exog_dim)
         x = self.value_embedding(x) + self.position_embedding(x)
         return self.dropout(x)
 
@@ -176,22 +176,38 @@ class TimeXerBackbone(nn.Module):
         config: ModelConfig,
     ):
         super().__init__()
-        if seq_len % config.patch_len != 0:
-            raise ValueError("seq_len must be divisible by patch_len")
-        if (seq_len + pred_len) % config.patch_len != 0:
-            raise ValueError("seq_len + pred_len must be divisible by patch_len")
+        if config.patch_stride <= 0:
+            raise ValueError("patch_stride must be positive")
+        if config.patch_len <= 0:
+            raise ValueError("patch_len must be positive")
+        if seq_len < config.patch_len:
+            raise ValueError("seq_len must be at least patch_len")
+        if seq_len + pred_len < config.patch_len:
+            raise ValueError("seq_len + pred_len must be at least patch_len")
+        if (seq_len - config.patch_len) % config.patch_stride != 0:
+            raise ValueError("seq_len must align with patch_stride")
+        if ((seq_len + pred_len) - config.patch_len) % config.patch_stride != 0:
+            raise ValueError("seq_len + pred_len must align with patch_stride")
 
         self.seq_len = seq_len
         self.pred_len = pred_len
         self.exog_dim = exog_dim
         self.patch_len = config.patch_len
-        self.patch_num = seq_len // config.patch_len
-        self.endogenous_embedding = EndogenousEmbedding(n_vars=1, d_model=config.d_model, patch_len=config.patch_len, dropout=config.dropout)
+        self.patch_stride = config.patch_stride
+        self.patch_num = (seq_len - config.patch_len) // config.patch_stride + 1
+        self.endogenous_embedding = EndogenousEmbedding(
+            n_vars=1,
+            d_model=config.d_model,
+            patch_len=config.patch_len,
+            patch_stride=config.patch_stride,
+            dropout=config.dropout,
+        )
         self.exogenous_embedding = ExogenousPatchEmbedding(
             total_len=seq_len + pred_len,
             exog_dim=exog_dim,
             d_model=config.d_model,
             patch_len=config.patch_len,
+            patch_stride=config.patch_stride,
             dropout=config.dropout,
         )
         self.encoder = Encoder(
@@ -219,21 +235,17 @@ class TimeXerBackbone(nn.Module):
         history_target: torch.Tensor,
         history_exog: torch.Tensor,
         future_exog: torch.Tensor,
+        series_token: torch.Tensor | None = None,
     ) -> torch.Tensor:
         endo_embed, n_vars = self.endogenous_embedding(history_target.unsqueeze(1))
         exo_embed = self.exogenous_embedding(history_exog, future_exog)
+        if series_token is not None:
+            exo_embed = torch.cat([series_token, exo_embed], dim=1)
         encoded = self.encoder(endo_embed, exo_embed)
         encoded = encoded.reshape(-1, n_vars, encoded.shape[-2], encoded.shape[-1])
         encoded = encoded.permute(0, 1, 3, 2)
         prediction = self.head(encoded)
         return prediction.permute(0, 2, 1).squeeze(-1)
-
-
-@dataclass
-class ForwardOutput:
-    prediction: torch.Tensor
-    prediction_norm: torch.Tensor
-    revin_stats: RevINStats
 
 
 class LoadForecastModel(nn.Module):
@@ -252,16 +264,28 @@ class LoadForecastModel(nn.Module):
         self.num_series = num_series
         self.config = config
 
-        self.revin = RevIN(num_features=1, eps=config.revin_eps, affine=config.revin_affine)
+        self.revin = RevIN(
+            num_features=1, num_series=num_series,
+            eps=config.revin_eps, affine=config.revin_affine,
+            per_station_affine=config.revin_per_station_affine,
+        )
         self.series_embedding = nn.Embedding(num_series, config.series_id_embedding_dim)
+        self.series_id_mode = config.series_id_mode
+        self.series_token_projection = nn.Linear(config.series_id_embedding_dim, config.d_model)
+        self.series_token_norm = nn.LayerNorm(config.d_model)
+        backbone_exog_dim = exog_dim
+        if config.series_id_mode == "repeat":
+            backbone_exog_dim = exog_dim + config.series_id_embedding_dim
+        elif config.series_id_mode != "token":
+            raise ValueError(f"Unsupported series_id_mode: {config.series_id_mode}")
         self.backbone = TimeXerBackbone(
             seq_len=seq_len,
             pred_len=pred_len,
-            exog_dim=exog_dim + config.series_id_embedding_dim,
+            exog_dim=backbone_exog_dim,
             config=config,
         )
 
-    def _append_series_embedding(
+    def _repeat_series_embedding(
         self,
         history_exog: torch.Tensor,
         future_exog: torch.Tensor,
@@ -275,6 +299,10 @@ class LoadForecastModel(nn.Module):
             torch.cat([future_exog, future_static], dim=-1),
         )
 
+    def _series_token(self, series_id: torch.Tensor) -> torch.Tensor:
+        token = self.series_token_projection(self.series_embedding(series_id))
+        return self.series_token_norm(token).unsqueeze(1)
+
     def forward(
         self,
         history_target: torch.Tensor,
@@ -284,20 +312,25 @@ class LoadForecastModel(nn.Module):
         return_aux: bool = False,
     ) -> torch.Tensor | ForwardOutput:
         history_target = history_target.unsqueeze(-1)
-        history_norm, stats = self.revin.normalize(history_target)
-        history_exog, future_exog = self._append_series_embedding(history_exog, future_exog, series_id)
+        history_norm, stats = self.revin.normalize(history_target, series_id=series_id)
+        series_token = None
+        if self.series_id_mode == "repeat":
+            history_exog, future_exog = self._repeat_series_embedding(history_exog, future_exog, series_id)
+        else:
+            series_token = self._series_token(series_id)
         prediction_norm = self.backbone(
             history_target=history_norm.squeeze(-1),
             history_exog=history_exog,
             future_exog=future_exog,
+            series_token=series_token,
         )
-        prediction = self.revin.denormalize(prediction_norm.unsqueeze(-1), stats).squeeze(-1)
+        prediction = self.revin.denormalize(prediction_norm.unsqueeze(-1), stats, series_id=series_id).squeeze(-1)
 
         if return_aux:
             return ForwardOutput(prediction=prediction, prediction_norm=prediction_norm, revin_stats=stats)
         return prediction
 
-    def normalize_future_target(self, future_target: torch.Tensor, stats: RevINStats) -> torch.Tensor:
+    def normalize_future_target(self, future_target: torch.Tensor, stats: RevINStats, series_id: torch.Tensor) -> torch.Tensor:
         future_target = future_target.unsqueeze(-1)
-        normalized = self.revin.normalize_with_stats(future_target, stats)
+        normalized = self.revin.normalize_with_stats(future_target, stats, series_id=series_id)
         return normalized.squeeze(-1)

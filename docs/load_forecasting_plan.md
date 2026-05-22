@@ -1,5 +1,9 @@
 # 负荷预测方案
 
+补充：
+
+- 分阶段实验清单见 [experiment_checklist.md](/Users/zhujian/Code/loadforecast/docs/experiment_checklist.md)
+
 ## 1. 任务目标
 
 - 数据范围：`data/` 目录下 4 个 CSV 文件
