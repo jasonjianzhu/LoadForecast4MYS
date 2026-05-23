@@ -8,11 +8,11 @@
 - **训练**：`station_balanced` 采样，Huber+MSE 主损失，验证/测试各场站最后 5/7 天滚动评估
 - **早停**：`early_stopping_metric=nrmse`，`patience=8`
 
-在 E04 基线上曾尝试：series token、场景损失加权、加强峰值损失；**仅加强峰值损失在测试集上有效**，其余回退。随后进一步验证了一个**按站点路由**的后处理方案：对 `GS / Tamura` 采用 `E04+E02`，对 `Plastone / Quality-Coils` 采用 `E04`。完整过程见 git 历史；仓库当前保留 E04、E04+E02 及 routed 评估结果。
+在 E04 基线上曾尝试：series token、场景损失加权、加强峰值损失、弱化 peak loss、特殊日切换特征、overlap patch，以及更换 `ModernTCN`/`TimeXer` backbone。最终结论很明确：**PatchTST 主线最强，单模型最优为 `E04+E02`，整体最优为 routed 方案**。完整过程见 git 历史；仓库当前仅保留可复现的 E04、E04+E02 与 routed 结果目录，其余失败实验结果目录已清理，但指标结论保留在本文档中。
 
 ---
 
-## 2. 保留实验
+## 2. 当前保留结果
 
 | 代号 | 配置 | 输出目录 | 用途 |
 |------|------|----------|------|
@@ -24,7 +24,7 @@
 
 ---
 
-## 3. 测试集结果（主要依据）
+## 3. 最终推荐结果
 
 | 指标 | E04 基线 (ep14) | E04+E02 (ep13) | Routed | 最优 |
 |------|-----------------|----------------|--------|------|
@@ -55,7 +55,33 @@
 
 ---
 
-## 4. 验证集（选模用，仅供参考）
+## 4. 完整实验结果汇总
+
+说明：
+- `状态=保留`：结果目录仍在仓库 `outputs/` 下，可直接复查。
+- `状态=已删除`：结果目录已清理，保留这里的指标结论，避免后续重复试错。
+
+| 实验 | Backbone / 改动 | Test MAE | Test RMSE | Test NRMSE | Test WAPE | 状态 | 结论 |
+|------|------------------|---------:|----------:|-----------:|----------:|------|------|
+| `0.2.0` | TimeXer 基线 | 57.71 | 93.18 | 0.0818 | 0.1877 | 保留 | 早期 TimeXer 基线 |
+| `TimeXer E02` | TimeXer + peak loss 原型 | 61.11 | 106.11 | 0.0932 | 0.1988 | 已删除 | 对 `GS` 伤害过大，不采纳 |
+| `TimeXer E05` | TimeXer + `series_id token` | 64.68 | 108.00 | N/A | N/A | 已删除 | `GS/Tamura` 明显变差，不采纳 |
+| `ModernTCN E04` | ModernTCN + station balanced | 55.56 | 88.31 | 0.0776 | 0.1807 | 已删除 | 整体优于 TimeXer，但被 PatchTST 超过 |
+| `PatchTST E04` | PatchTST + station balanced | 50.83 | 82.17 | 0.0722 | 0.1653 | 保留 | PatchTST 主线基线 |
+| `PatchTST E04+E02` | PatchTST + stronger peak loss | 50.54 | 77.59 | 0.0681 | 0.1644 | 保留 | 单模型最优 |
+| `PatchTST Routed` | `GS/Tamura -> E04+E02`, `Plastone/Quality -> E04` | **49.12** | **76.68** | **0.0673** | **0.1598** | 保留 | 整体最优，推荐上线 |
+| `PatchTST S1+S2` | 去掉 `daily_max` + 弱化 peak loss | 51.61 | 82.35 | 0.0723 | 0.1679 | 已删除 | 峰值支撑不足，整体退步 |
+| `PatchTST SpecialDay` | 增加 bridging / pre-post 半天 / 距离假日特征 | 58.63 | 90.61 | 0.0796 | 0.1907 | 已删除 | 新特征引入噪声，不采纳 |
+| `PatchTST Overlap` | `patch_stride 12 -> 6` | 63.15 | 98.27 | 0.0863 | 0.2054 | 已删除 | overlap patch 明显负优化 |
+
+补充观察：
+- `E04+E02` 的收益主要来自 `GS / Tamura` 的峰值约束增强。
+- `E04` 对 `Plastone / Quality` 的普通时段更稳。
+- `Routed` 的价值正是利用了这两点互补性。
+
+---
+
+## 5. 验证集（选模用，仅供参考）
 
 | 指标 | E04 | E04+E02 |
 |------|-----|---------|
@@ -66,17 +92,19 @@ E04+E02 在验证集上略差于 E04，但**测试集 7 天滚动**明显更好�
 
 ---
 
-## 5. 已尝试但未采纳的改动
+## 6. 已尝试但未采纳的改动
 
 | 改动 | 结论 |
 |------|------|
-| `series_id_mode: token` | 测试 NRMSE 0.076，holiday 场景更差，不采纳 |
-| `scenario_loss_weights`（节假日场景 1.1–1.25） | 测试 NRMSE 0.084，GS 明显变差，不采纳 |
-| token + scenario + peak 组合 | 未跑；前两步已失败，无必要 |
+| `series_id_mode: token` | 对 `Quality` 略有帮助，但 `GS/Tamura` 明显变差，不采纳 |
+| `scenario_loss_weights`（节假日场景 1.1–1.25） | `GS` 明显变差，验证 holiday 也没有净收益，不采纳 |
+| 弱化 peak loss (`S1+S2`) | 峰值支撑回落，单模型整体退步，不采纳 |
+| 特殊日切换特征 | 当前数据量下信息增益不够，反而引入噪声，不采纳 |
+| overlap patch | 在当前设置下明显负优化，不采纳 |
 
 ---
 
-## 6. Routed 方案说明
+## 7. Routed 方案说明
 
 Routed 不是新训练出的第三个模型，而是一个**按站点选择现有最优模型**的后处理方案：
 
@@ -100,7 +128,7 @@ Routed 方案在测试集上的整体指标优于当前最优单模型：
 
 ---
 
-## 7. E04+E02 相对 E04 的配置差异
+## 8. E04+E02 相对 E04 的配置差异
 
 ```json
 "peak_loss_weight": 0.3,
@@ -112,20 +140,21 @@ Routed 方案在测试集上的整体指标优于当前最优单模型：
 
 ---
 
-## 8. 结论与建议
+## 9. 结论与建议
 
 1. **生产推荐**：优先采用 `Routed` 方案，即 `GS / Tamura -> E04+E02`，`Plastone / Quality-Coils -> E04`。
 2. **单模型推荐**：若部署链路只允许单模型，则使用 `patchtst_e04_e02_peak_loss`，checkpoint `patchtst_e04_e02_best_epoch13.pt`。
 3. **基线保留**：E04 用于回归对比与 ablation 参照。
-4. **业务解读**：GS 绝对误差仍最大；节假日切换（`weekday→holiday`）仍是弱项，不宜仅靠 loss 加权，后续可考虑日历特征增强或加长验证窗。
-5. **复现训练**：
+4. **优化结论**：当前这条 `PatchTST` 小步调参路线已经接近上限，继续削弱 peak loss、补特殊日特征、或做 overlap patch 都没有带来净收益。
+5. **业务解读**：GS 绝对误差仍最大；节假日切换（`weekday→holiday`）仍是弱项，不宜仅靠 loss 加权，后续若再提升，建议转向更大改动的路线，例如 TSFM、正式化站点路由推理或新增业务特征。
+6. **复现训练**：
 
 ```bash
 ./.venv/bin/python scripts/train_timexer.py --config configs/experiments/patchtst_e04_balanced_sampler.json
 ./.venv/bin/python scripts/train_timexer.py --config configs/experiments/patchtst_e04_e02_peak_loss.json
 ```
 
-6. **复现 routed 评估**：
+7. **复现 routed 评估**：
 
 ```bash
 ./.venv/bin/python scripts/build_routed_experiment.py
