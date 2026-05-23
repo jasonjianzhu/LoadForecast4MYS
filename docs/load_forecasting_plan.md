@@ -123,6 +123,26 @@ RevIN 只作用在目标序列 `load(kW)` 上，日历协变量不参与 RevIN�
 - 轻度提升样本较少站点的曝光次数
 - 不直接通过 loss 对站点做强加权
 
+采样权重公式为：
+
+```text
+sample_weight = 1 / (station_sample_count ^ power)
+```
+
+其中：
+
+- `sample_weight` 表示某个训练样本被 `WeightedRandomSampler` 抽到的权重
+- `station_sample_count` 表示该样本所属站点在训练集中的样本数量
+- `power = station_balance_power = 0.5`
+
+在当前 0.4.1 配置下，等价于：
+
+```text
+sample_weight = 1 / sqrt(station_sample_count)
+```
+
+因此，样本较少的站点会被更频繁抽到，但又不是完全强行拉平成四个站点一样多。这是一种温和的站点平衡采样策略。这里的 `balanced sampler` 只影响训练时“样本怎么抽”，不改变损失函数本身；`E04` 和 `E04+E02` 都使用同一套采样公式，只是峰值损失强度不同。
+
 ### 6.2 优化器与训练超参数
 
 统一配置：
@@ -157,6 +177,15 @@ L_pointwise = 0.7 * Huber + 0.3 * MSE
 - `pointwise_peak_focus_weight = 0.0`
 - `underprediction_weight = 0.0`
 
+含义如下：
+
+- `base_loss = hybrid` 表示基础逐点损失不用 `pinball`，而是采用 `Huber` 与 `MSE` 的混合形式
+- `huber_delta = 1.0` 是 Huber 损失的拐点参数。在归一化空间中，误差较小时按平方误差处理，误差较大时转为线性惩罚，用来兼顾训练稳定性和对大误差的敏感度
+- `pointwise_peak_focus_weight = 0.0` 表示在基础逐点损失层，不额外对高负荷点乘更大的逐点权重；也就是说，`L_pointwise` 本身对全天所有时刻一视同仁
+- `underprediction_weight = 0.0` 表示在基础逐点损失层，不额外增加一个“低估惩罚”项；低估约束放到后面的峰值辅助损失里处理
+
+这样设计的目的，是让 `L_pointwise` 专注于全天 288 点曲线的整体拟合稳定性，包括基线水平、普通时段和大部分波形结构；峰值相关的偏置修正，则交给后面的峰值辅助项去承担。
+
 ### 7.2 E04 基线
 
 `E04` 在主损失外，再加较温和的峰值约束：
@@ -172,6 +201,20 @@ L_total
 
 - `peak_top_k = 24`
 - `daily_max_loss_weight = 0.0`
+
+更细一点地说：
+
+- `L_pointwise` 是全天 288 点的基础逐点损失，负责保证整条曲线整体稳定、不过分抖动
+- `L_peak_topk` 只在真实未来负荷最高的 `top-k` 个点上计算 Huber 损失。当前 `peak_top_k = 24`，也就是一天中真实负荷最高的 24 个 5 分钟点
+- `L_underprediction_topk` 也只作用在同样的真实高峰点上，定义为 `mean(relu(true_topk - pred_topk))`，即只惩罚峰值低估，不额外惩罚峰值高估
+
+换句话说，`E04` 的设计是：
+
+- 用 `L_pointwise` 保证整天曲线大体画对
+- 用 `0.2 * L_peak_topk` 告诉模型“高峰区域更重要，局部形状和幅值要拟合得更准”
+- 用 `0.08 * L_underprediction_topk` 告诉模型“高峰尤其不要系统性压低”
+
+`daily_max_loss_weight = 0.0` 表示 `E04` 不直接约束“当天最大值必须多高”，而是只通过真实高峰点的局部约束来改善峰值预测。这样做更稳，对 `Plastone / Quality` 这类普通时段表现较敏感的站点副作用更小。
 
 特点：
 
@@ -194,6 +237,16 @@ L_total
 
 - `peak_top_k = 24`
 - `daily_max_loss_weight = 0.1`
+
+这里的 `L_daily_max` 定义为：
+
+```text
+L_daily_max = (max(pred) - max(true))^2
+```
+
+也就是单独比较“当天预测曲线的最大值”和“当天真实曲线的最大值”之间的差距。前面的 `0.1` 是它的损失权重，表示这项约束是辅助性的，不会压过主损失和 `top-k` 峰值损失，但会持续提醒模型：除了峰值附近整段形状要对，整天最高点的幅值也不能偏得太离谱。
+
+这意味着：在 `E04` 的基础上，进一步提高真实高峰点拟合和峰值低估惩罚的强度，同时再加一项 `L_daily_max` 去约束“当天最大值”的幅度。相比 `E04`，这版更积极地拉高峰值，因此更适合 `GS / Tamura` 这类峰值更难抓的站点，并最终成为当前单模型最优方案。
 
 特点：
 
