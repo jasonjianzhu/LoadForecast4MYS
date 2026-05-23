@@ -1,154 +1,64 @@
-# 负荷预测方案
+# 负荷预测方案（0.4.1）
 
-补充：
+## 1. 任务定义
 
-- 分阶段实验清单见 [experiment_checklist.md](/Users/zhujian/Code/loadforecast/docs/experiment_checklist.md)
-
-## 1. 任务目标
-
-- 数据范围：`data/` 目录下 4 个 CSV 文件
+- 数据目录：`data/`
+- 场站数量：4 个
 - 目标字段：`load(kW)`
-- 预测任务：输入前 7 天的负荷时序，预测未来 1 天的负荷曲线
 - 时间粒度：5 分钟
-- 输入长度：`7 x 24 x 12 = 2016` 点
-- 输出长度：`24 x 12 = 288` 点
-- 当前已知场站位置：
-  - `Simpli-Quality-Coils` 位于 `Kampar, Perak, Malaysia`
-  - 其他站点当前默认按 `Shah Alam, Selangor, Malaysia` 处理，后续可继续补充站点级位置映射
+- 输入窗口：前 7 天，共 `2016` 点
+- 预测窗口：未来 1 天，共 `288` 点
 
-## 2. 数据现状
+当前任务是标准的 day-ahead 负荷预测：
 
-- 4 份 CSV 都包含 `Time` 和 `load(kW)` 字段
-- 主体数据为 5 分钟粒度，无需重采样到 15 分钟
-- `Tamura_Electronics_20260210_20260512_load(PV&meter).csv` 尾部存在空白记录，需要在清洗阶段剔除
-- `Simpli-Quality-Coils_20260206_20260512_load.csv` 含有无关列 `Unnamed: 4`，可直接忽略
-- 不同文件的负荷量级和波动模式不同，因此采用多序列全局训练，而不是每个文件单独建模
-- 后续训练和推理脚本统一从 `data/` 目录读取原始 CSV
-
-## 3. 数据清洗
-
-对每个 CSV 执行统一的数据预处理：
-
-1. 读取 `Time` 和 `load(kW)`，忽略无关列
-2. 将 `Time` 解析为时间戳，按时间升序排序
-3. 去除空时间、重复时间和无效尾部空白记录
-4. 对齐到完整的 5 分钟时间轴
-5. 短缺口可做有限插补，长缺口所在窗口直接丢弃
-6. 保留每个文件的 `series_id`，用于全局模型区分场站
-
-## 4. 监督样本构造
-
-采用滑动窗口构造监督样本：
-
-- 输入窗口：历史 `2016` 点 `load(kW)`
-- 输出窗口：未来 `288` 点 `load(kW)`
-
-形式如下：
-
-```text
-X = load[t-2016 : t)
-Y = load[t : t+288)
-```
-
-训练阶段采用 `stride = 6`，即每 30 分钟切一个样本。
-
-这样做的原因：
-
-- 比 `stride=24` 更密，能覆盖更多突变和尖峰
-- 比 `stride=1` 或 `stride=3` 更稳，避免样本高度重复
-- 结合当前数据规模，清洗后预计可得到约 1.2 万个有效训练窗
-
-验证和测试阶段按“天”滚动评估，使用 `stride = 288`，与真实使用场景保持一致。
-
-## 5. 模型方案
-
-主模型采用 `TimeXer + RevIN`。
-
-### 5.1 为什么选 TimeXer
-
-本任务不是单纯的裸负荷外推，而是包含“未来已知日历特征”的负荷预测。`TimeXer` 的结构就是为 exogenous forecasting 设计，适合联合建模：
-
-- 历史负荷序列本身的动态变化
-- 未来已知协变量对负荷曲线的影响
-
-相较于 `PatchTST`、`ModernTCN`、`iTransformer`，当前任务中 `TimeXer` 更贴合“单目标负荷 + 未来日历特征”的建模方式。
-
-实现备注：
-
-- 代码实现采用本地 `TimeXer` 变体
-- 内生路径仅接收历史 `load(kW)`
-- 外生路径接收“历史协变量 + 未来已知协变量”的拼接序列
-- 当前实现中，外生路径不再把整条轨迹直接压成 feature tokens，而是按时间切成 exogenous patch tokens
-- 这样可以在保留未来已知日历特征的同时，更好保留“什么时候起峰、什么时候切换到周末/节假日”的时间结构
-
-### 5.2 为什么加 RevIN
-
-`RevIN` 用来处理负荷序列在不同日期之间的均值和波动范围漂移问题。工业负荷中常见：
-
-- 工作日和节假日基线不同
-- 白天和夜间波动幅度不同
-- 设备启停导致分布切换
-
-因此使用 `RevIN` 对每个样本窗口做可逆归一化，再由模型输出后反归一化回 `kW`。
-
-### 5.3 初始架构配置
-
-当前数据只有 4 个场站，样本量中等，因此默认配置不宜盲目堆大，但需要比最初版本更强调高频峰值和局部时序。
-
-固定任务参数：
-
-- `seq_len = 2016`
-- `pred_len = 288`
-- `enc_in = 1`
-- `c_out = 1`
-
-建议的初始主配置：
-
-- `e_layers = 4`
-- `d_model = 192`
-- `d_ff = 384`
-- `n_heads = 4`
-- `dropout = 0.1`
-- `patch_len = 12`
-- `series_id_embedding_dim = 2`
-
-建议的可调范围：
-
-- `e_layers`: `2` 到 `4`
-- `d_model`: `128` 或 `192`
-- `d_ff`: `256` 到 `512`
-- `n_heads`: `4` 或 `8`
-- `dropout`: `0.1` 到 `0.2`
-- `patch_len`: `12`、`24`、`36`
-- `series_id_embedding_dim`: `2` 到 `4`
+- 预测第 `t` 天时，输入为前 `7` 个完整自然日的真实负荷
+- 输出为第 `t` 天 `00:00-23:55` 的完整 288 点曲线
+- 验证和测试都按天滚动，不跨天
 
 说明：
 
-- `patch_len = 12` 对应 `1` 小时感受野，更适合当前 `GS`、`Tamura` 这类峰值容易被压扁的负荷
-- 若训练后发现模型过度追随噪声，可再回退到 `patch_len = 24`
-- 若希望增强平滑趋势建模，可尝试 `patch_len = 36`
-- `series_id` 只有 4 个取值，因此 embedding 维度保持小规模，避免过拟合
+- 测试阶段采用滚动窗口评估，而不是递推 7 天预测
+- 例如预测第 9 天时，输入是第 2-8 天的真实值，不会把第 8 天预测值回灌
 
-## 6. 归一化策略
+## 2. 数据处理
 
-直接采用 `RevIN` 处理目标序列 `load(kW)`：
+对每个 CSV 统一执行以下处理：
 
-- 对每个训练样本窗口单独计算统计量
-- 使用窗口内的均值和标准差进行归一化
-- 模型输出未来 288 点后，再使用同一窗口统计量反归一化
+1. 读取 `Time` 和 `load(kW)`
+2. 时间戳标准化并按时间排序
+3. 去重，重复时刻取均值
+4. 对齐到完整的 5 分钟时间轴
+5. 只保留完整自然日进入验证/测试
+6. 目标值做下界裁剪：`target_clip_min = 0.0`
 
-约束如下：
+当前站点假日归属：
 
-- `RevIN` 只作用于目标序列 `load(kW)`
-- 日历协变量不做 `RevIN`
-- `series_id` 使用 embedding，不做数值归一化
-- 第一版完整训练默认使用 `affine=False`，避免在归一化空间训练时出现可学习尺度塌缩
+- `Simpli-Quality-Coils` -> `Perak (PRK)`
+- 其他站点 -> `Selangor (SGR)`
 
-## 7. 外生特征设计
+## 3. 样本构造与切分
 
-由于不同场站可能位于不同州，因此引入马来西亚联邦假日和“站点所在州”的州假日特征。当前代码支持按站点覆盖州别配置。
+### 3.1 训练样本
 
-未来已知协变量包括：
+- 输入：`load[t-2016 : t)`
+- 输出：`load[t : t+288)`
+- 训练步长：`train_stride = 6`
+
+即训练阶段每 30 分钟切一个监督样本。
+
+### 3.2 验证与测试
+
+- 每个场站最后 `7` 个完整自然日作为测试集
+- 测试集之前的 `5` 个完整自然日作为验证集
+- 每个验证/测试样本都严格按天对齐
+
+切分逻辑在：
+
+- `src/loadforecast/data.py`
+
+## 4. 外生特征
+
+当前版本只保留验证过有效的基础日历特征，共 9 维：
 
 - `minute_of_day_sin`
 - `minute_of_day_cos`
@@ -159,183 +69,170 @@ Y = load[t : t+288)
 - `is_state_holiday`
 - `is_pre_holiday`
 - `is_post_holiday`
-- `series_id`
-
-原则：
-
-- 只使用预测时刻已知的未来特征
-- 不引入未来不可知的 `Meter(kW)`、`PV(kW)` 等变量
-
-### 7.1 节假日前后特征定义
-
-第一版将 `is_pre_holiday` 与 `is_post_holiday` 明确定义为日级特征：
-
-- `is_pre_holiday = 1`：当前时间点所在自然日为某个节假日的前 `1` 天
-- `is_post_holiday = 1`：当前时间点所在自然日为某个节假日的后 `1` 天
-
-这里的节假日同时包含：
-
-- 马来西亚联邦假日
-- 对应站点所在州的州假日
-
-当前默认配置为：
-
-- 大多数站点使用 `Selangor`
-- `Simpli-Quality-Coils` 使用 `Perak`
-- 站点与州别通过“完整站点名 -> 州代码”的精确映射表配置，不使用模糊子串匹配
 
 说明：
 
-- 先采用前 `1` 天 / 后 `1` 天的简单定义，避免在样本量有限时制造过多稀疏特征
-- 若验证集显示节前样本误差仍明显偏高，再增补更细粒度特征，例如：
-  - `is_pre_holiday_pm`：节前一天 `12:00` 之后
-  - `days_to_holiday`
-  - `days_after_holiday`
+- 已尝试更细的“特殊日切换”特征，如 bridging holiday、节前下午、节后上午、距假日天数等，但在当前数据规模下带来净退步，因此 0.4.1 不采用
+- 不使用未来不可知的 `PV(kW)`、`Meter(kW)` 等变量
 
-## 8. 训练策略
+## 5. 模型结构
 
-采用全局多序列训练：
+0.4.1 的主线模型为 `PatchTST + RevIN`。
 
-- 将 4 个 CSV 统一整理为一个训练集
-- 通过 `series_id` 区分不同场站
-- 输入历史负荷 + 已知未来协变量
-- 直接输出未来 288 点，不使用逐点递推
+### 5.1 PatchTST
 
-损失函数优先考虑对尖峰更稳健、并减少高负荷低估的配置。
+当前统一结构配置：
 
-当前默认训练目标为组合损失：
-
-- `0.5 * Huber Loss`
-- `0.5 * MSE`
-- 外加轻量的 `underprediction penalty`
-- 并对每个预测窗中最高负荷 `10%` 的时间点加权
-
-### 8.1 训练超参数初始配置
-
-建议的第一版训练超参数如下：
-
-- optimizer: `AdamW`
-- learning rate: `1e-3`
-- weight decay: `1e-4`
-- batch size: `16`
-- max epochs: `60`
-- early stopping patience: `8`
-- lr scheduler: `ReduceLROnPlateau` 或 `CosineAnnealing`
-- gradient clipping: `1.0`
-
-建议的可调范围：
-
-- learning rate: `3e-4` 到 `1e-3`
-- batch size: `8`、`16`、`32`
-- max epochs: `40` 到 `80`
-- patience: `6` 到 `10`
+- `backbone = patchtst`
+- `d_model = 192`
+- `d_ff = 384`
+- `e_layers = 4`
+- `n_heads = 4`
+- `dropout = 0.1`
+- `patch_len = 12`
+- `patch_stride = 12`
+- `series_id_embedding_dim = 2`
+- `series_id_mode = repeat`
 
 说明：
 
-- 由于输入长度为 `2016`，显存压力不会太小，`batch size` 优先从 `16` 起试
-- 若显存紧张，则退到 `8`
-- 若训练较稳且显存足够，可尝试 `32`
-- `early stopping` 依据验证集滚动日级指标触发，而不是训练损失
+- 已尝试 overlap patch（`patch_stride = 6`），测试集明显退步，因此 0.4.1 不采用
+- 已尝试 `series_id token`，对 `Quality` 略有帮助，但 `GS/Tamura` 明显变差，因此不采用
 
-### 8.2 Huber Loss 的 delta
+### 5.2 RevIN
 
-由于本方案采用 `RevIN` 对输入输出做窗口级标准化，因此基础误差项仍优先在归一化空间计算。
+当前统一配置：
 
-在该前提下，`delta` 使用归一化后的无量纲值更合理，当前默认建议：
+- `revin_affine = false`
+- `revin_per_station_affine = false`
+- `revin_eps = 1e-5`
 
-- 初始值：`delta = 1.0`
-- 验证范围：`0.5`、`1.0`、`1.5`
+RevIN 只作用在目标序列 `load(kW)` 上，日历协变量不参与 RevIN。
 
-原因：
+## 6. 训练方式
 
-- 归一化后不同场站的量纲差异被压平
-- 若直接在原始 `kW` 空间设置 `delta`，大场站会显著主导损失
-- 叠加 `MSE` 与 `underprediction penalty` 后，可以在保留稳健性的同时，减少峰值被系统性压低的问题
+### 6.1 采样
 
-若后续需要在原始 `kW` 空间补充辅助损失，可参考各场站标准差设置初始量级，但不作为第一版默认方案。
+训练使用站点均衡采样：
 
-## 9. 数据切分与验证
+- `train_sampler = station_balanced`
+- `station_balance_power = 0.5`
 
-采用“固定测试集 + 滚动验证”的时间切分方式，不打乱样本。
+作用：
 
-### 9.1 测试集
+- 轻度提升样本较少站点的曝光次数
+- 不直接通过 loss 对站点做强加权
 
-- 每个场站最后 `7` 天作为测试集
-- 测试集完全隔离，不参与调参和 early stopping
-- 最终报告指标以该测试区间的滚动回测结果为准
+### 6.2 优化器与训练超参数
 
-### 9.2 验证集
+统一配置：
 
-- 在测试集之前，选取 `5` 个预测日做滚动验证
-- 每个验证样本都遵循同一任务定义：
-  - 输入前 `7` 个完整自然日的 `2016` 点
-  - 预测后 `1` 个完整自然日的 `288` 点
-- 验证集用于：
-  - early stopping
-  - 学习率与 epoch 选择
-  - 节假日相关特征配置调整
-  - `RevIN` 风险场景的专项误差监控
+- `optimizer = AdamW`
+- `learning_rate = 1e-3`
+- `weight_decay = 1e-4`
+- `batch_size = 16`
+- `eval_batch_size = 32`
+- `max_epochs = 60`
+- `early_stopping_patience = 8`
+- `early_stopping_metric = nrmse`
+- `scheduler = ReduceLROnPlateau`
+- `grad_clip_norm = 1.0`
 
-采用滚动验证而不是切一整块静态验证集，原因是：
+## 7. 损失函数
 
-- 当前两份 Plastone 数据总长度只有约 `47` 天
-- 若直接切出较大静态验证段，会明显压缩可训练样本
-- 滚动验证更贴近真实使用方式，也更适合比较整天曲线预测质量
+0.4.1 有两套实际保留的单模型配置：`E04` 和 `E04+E02`。
 
-### 9.3 训练集
+### 7.1 公共主损失
 
-- 训练集使用每个场站在验证集之前的全部可用历史数据
-- 训练样本按 `stride = 6` 构造
-- 只保留输入窗和预测窗都完整可用的样本
+两者主损失相同，都是：
 
-### 9.4 评估方式
+```text
+L_pointwise = 0.7 * Huber + 0.3 * MSE
+```
 
-- 用前 `7` 个完整自然日预测后 `1` 个完整自然日
-- 验证集按 `5` 个预测日逐天滚动评估
-- 测试集按最后 `7` 个预测日逐天滚动评估
-- 验证和测试都按天滑动窗口，不跨天：
-  - 每个预测窗固定覆盖 `00:00` 到 `23:55`
-  - 对应输入窗固定为该预测日前连续 `7` 个完整自然日
-- 不使用跨天起点的评估窗，例如 `14:35 -> 次日 14:30` 这类窗口不进入验证和测试
-- 所有指标全部保留并统一计算，包括：
-  - `MAE`
-  - `RMSE`
-  - `NMAE`
-  - `NRMSE`
-  - `WAPE`
-  - `MAPE`
-- 同时绘制真实值与预测值曲线，检查波形形状、峰值位置和节假日响应
+补充配置：
 
-### 9.5 指标定义
+- `base_loss = hybrid`
+- `huber_delta = 1.0`
+- `pointwise_peak_focus_weight = 0.0`
+- `underprediction_weight = 0.0`
 
-设真实值为 `y`，预测值为 `y_hat`，误差为 `e = y_hat - y`。
+### 7.2 E04 基线
 
-- `MAE = mean(|e|)`
-- `RMSE = sqrt(mean(e^2))`
-- `NMAE = MAE / (y_max - y_min)`
-- `NRMSE = RMSE / (y_max - y_min)`
-- `WAPE = sum(|e|) / sum(|y|)`
+`E04` 在主损失外，再加较温和的峰值约束：
+
+```text
+L_total
+= L_pointwise
++ 0.2  * L_peak_topk
++ 0.08 * L_underprediction_topk
+```
 
 其中：
 
-- `y_max` 和 `y_min` 使用对应评估区间真实 `load(kW)` 的最大值和最小值
-- `NMAE` 和 `NRMSE` 采用同一归一化口径，便于跨站点比较
+- `peak_top_k = 24`
+- `daily_max_loss_weight = 0.0`
 
-### 9.7 RevIN 风险监控
+特点：
 
-`RevIN` 的已知风险之一，是输入窗口和输出窗口处于不同运行模式时，输入窗口统计量可能对输出窗口形成偏置。例如：
+- 对 `Plastone / Quality` 的普通时段更稳
+- 作为当前主线基线保留
 
-- 输入 7 天主要为工作日
-- 输出 1 天为周末或节假日
+### 7.3 E04+E02 单模型最优
 
-因此在验证和测试阶段，需要按场景拆分误差，至少监控以下几类预测日：
+`E04+E02` 在 `E04` 基础上加强峰值约束：
 
-- `weekday -> weekday`
-- `weekday -> weekend`
-- `weekday -> holiday`
-- `holiday/weekend -> weekday`
+```text
+L_total
+= L_pointwise
++ 0.3  * L_peak_topk
++ 0.15 * L_underprediction_topk
++ 0.1  * L_daily_max
+```
 
-监控指标：
+其中：
+
+- `peak_top_k = 24`
+- `daily_max_loss_weight = 0.1`
+
+特点：
+
+- 对 `GS / Tamura` 的峰值支撑更强
+- 当前单模型最优
+
+说明：
+
+- 已尝试进一步弱化 peak loss（`S1+S2`），整体退步
+- 已尝试 overlap patch、特殊日扩展特征，也都退步
+
+## 8. 当前推荐方法
+
+### 8.1 生产推荐：Routed
+
+0.4.1 的整体最优方案不是单个 checkpoint，而是按站点路由的后处理方案：
+
+- `GS / Tamura` -> 使用 `E04+E02`
+- `Plastone / Quality-Coils` -> 使用 `E04`
+
+路由脚本：
+
+- `scripts/build_routed_experiment.py`
+
+该方案的核心思想是：
+
+- `E04+E02` 更擅长 `GS / Tamura` 的峰值约束
+- `E04` 更适合 `Plastone / Quality` 的普通时段稳定性
+
+### 8.2 单模型推荐
+
+如果部署链路只允许一个模型，则使用：
+
+- `PatchTST E04+E02`
+- checkpoint：`patchtst_e04_e02_best_epoch13.pt`
+
+## 9. 评估指标
+
+统一输出以下指标：
 
 - `MAE`
 - `RMSE`
@@ -344,35 +241,67 @@ Y = load[t : t+288)
 - `WAPE`
 - `MAPE`
 
-若 `weekday -> holiday` 或 `weekday -> weekend` 的误差显著劣化，则需要做如下消融：
+定义口径：
 
-- `RevIN on` vs `RevIN off`
-- `affine=True` vs `affine=False`
-- 是否补充更细粒度的节前/节后特征
+- `NMAE = MAE / (y_max - y_min)`
+- `NRMSE = RMSE / (y_max - y_min)`
+- `WAPE = sum(|error|) / sum(|y_true|)`
+- `MAPE = mean(|error| / max(|y_true|, 1.0))`
 
-### 9.6 MAPE 计算口径
+此外还单独监控峰值诊断：
 
-由于真实负荷中存在接近 `0` 的值，直接计算标准 `MAPE` 会不稳定，因此文档中保留 `MAPE`，但采用稳定化实现：
+- `peak_ratio_mean`
+- `peak_err_mean`
+- `nonpeak_bias_mean`
 
-- `MAPE = mean(|e| / max(|y|, 1.0))`
+## 10. 0.4.1 结果概览
 
-说明：
+### 10.1 单模型
 
-- 分母设置 `1.0 kW` 下限，避免真实值接近 `0` 时指标发散
-- `MAPE` 仍然保留并输出，但解释时不作为唯一主指标
-- 业务判断优先参考 `MAE`、`RMSE`、`NMAE`、`NRMSE` 和 `WAPE`
+- `E04`
+  - `MAE = 50.83`
+  - `RMSE = 82.17`
+  - `NRMSE = 0.0722`
+  - `WAPE = 0.1653`
 
-## 10. 最终交付
+- `E04+E02`
+  - `MAE = 50.54`
+  - `RMSE = 77.59`
+  - `NRMSE = 0.0681`
+  - `WAPE = 0.1644`
 
-计划输出：
+### 10.2 Routed
 
-- 4 份预测结果 CSV
-- 4 张真实值 vs 预测值曲线图
-- 1 份汇总误差表（含 `MAE`、`RMSE`、`NMAE`、`NRMSE`、`WAPE`、`MAPE`）
-- 训练与推理脚本
+- `MAE = 49.12`
+- `RMSE = 76.68`
+- `NRMSE = 0.0673`
+- `WAPE = 0.1598`
 
-## 11. 实施备注
+结论：
 
-- `data/` 目录中的原始数据已足够开展第一版实验
-- Python 环境固定为 `3.12`
-- 先完成环境搭建与项目初始化，再进入建模实现阶段
+- `E04+E02` 是单模型最优
+- `Routed` 是整体最优，也是 0.4.1 的生产推荐
+
+## 11. 图表资产
+
+0.4.1 routed 方案的四张单站测试图已转存到可跟踪目录：
+
+- `docs/figures/0.4.1/simpli_gs_paperboard_and_packaging_sdn_bhd_test_curve.svg`
+- `docs/figures/0.4.1/simpli_plastone_technolngy_packaging_sdn_bhd_test_curve.svg`
+- `docs/figures/0.4.1/simpli_quality_coils_test_curve.svg`
+- `docs/figures/0.4.1/tamura_electronics_test_curve.svg`
+
+## 12. 后续建议
+
+在当前数据、特征和监督框架下，小步调参已经接近上限。继续提升时，优先级建议为：
+
+1. 正式化 routed 推理链路
+2. 评估 TSFM 路线，如 `Chronos-2` / `TimesFM`
+3. 引入更强业务特征，如班次、停机计划、工艺日历
+
+不建议继续沿当前 `PatchTST` 主线做以下方向：
+
+- 继续弱化 peak loss
+- 特殊日切换特征扩展
+- overlap patch
+- `series_id token`
